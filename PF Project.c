@@ -1,1127 +1,911 @@
+/*
+  budget_tracker_optimized.c
+  Optimized version with centered container and left-aligned menus.
+  Compile: gcc -o budget_tracker budget_tracker_optimized.c
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
 
+/* Cross-platform sleep utility */
 #ifdef _WIN32
 #include <windows.h>
 #define sleep_ms(ms) Sleep(ms)
 #else
 #include <unistd.h>
-#include <time.h>
-static void sleep_ms(int ms) {
-    struct timespec ts; 
-    ts.tv_sec = ms/1000; 
-    ts.tv_nsec = (ms%1000)*1000000;
-    nanosleep(&ts, NULL);
-}
+static void sleep_ms(int ms) { usleep(ms * 1000); }
 #endif
 
-#define USERS_FILE "users.csv"
+/* ---------- Config & constants ---------- */
+#define TERM_WIDTH 80
+#define CONTAINER_WIDTH 70  // Reduced width for the container
+#define USERS_CSV "users.csv"
+#define MAX_TXNS 2000
+#define MAX_CATS 60
 #define MAX_LINE 1024
-#define MAX_CATS 100
-#define MAX_CAT_LEN 64
+#define XOR_KEY 0x5A
 
-// ANSI color codes
-#define RESET   "\033[0m"
-#define BOLD    "\033[1m"
-#define CYAN    "\033[36m"
-#define YELLOW  "\033[33m"
-#define GREEN   "\033[32m"
-#define RED     "\033[31m"
-#define MAGENTA "\033[35m"
-#define WHITE   "\033[37m"
+/* ANSI colors - Standardized */
+#define C_RESET  "\033[0m"
+#define C_BOLD   "\033[1m"
+#define C_GREEN  "\033[32m"
+#define C_YELLOW "\033[33m"
+#define C_RED    "\033[31m"
+#define C_CYAN   "\033[36m"
+#define C_MAGENTA "\033[35m"
+#define C_B_GREEN "\033[1;32m"
+#define C_B_RED   "\033[1;31m"
+#define C_BLUE    "\033[34m"
+#define C_B_BLUE  "\033[1;34m"
 
-// ---------------------- Structs ----------------------
-
+/* ---------- Types ---------- */
 typedef struct {
-    int id;
-    char username[64];
-    char password_enc[128]; // XOR-obfuscated
-} User;
-
-typedef struct {
-    int id;
-    char type[12];     // "Income" or "Expense"
+    int day, month, year;
+    char type[12];      /* "Income" / "Expense" */
     char category[64];
     double amount;
-    char date[16];     // "DD/MM/YYYY"
-    char note[256];
+    char note[192];
+    int id;
 } Transaction;
 
-typedef struct {
-    Transaction *arr;
-    int size;
-    int cap;
-} TxnList;
+/* ---------- Global session ---------- */
+static char cur_user[64] = "";
+static Transaction txns[MAX_TXNS];
+static int txn_count = 0;
+static char cats[MAX_CATS][64];
+static int cat_count = 0;
+static double monthly_budget = 0.0;
 
-// ---------------------- Utilities ----------------------
+/* ---------- Utility functions: UI/UX ---------- */
 
-void clear_screen() {
-#ifdef _WIN32
-    system("cls");
-#else
-    system("clear");
-#endif
-}
-
-void safe_input(char *buf, int sz) {
-    if (!fgets(buf, sz, stdin)) { 
-        buf[0] = '\0'; 
-        return; 
+// Print container border
+static void print_border_line(int is_top) {
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    printf("%*s%s", pad, "", C_B_BLUE);
+    if (is_top) {
+        printf("+");
+        for (int i = 0; i < CONTAINER_WIDTH - 2; i++) printf("-");
+        printf("+");
+    } else {
+        printf("+");
+        for (int i = 0; i < CONTAINER_WIDTH - 2; i++) printf("-");
+        printf("+");
     }
-    size_t l = strlen(buf); 
-    if (l && buf[l-1] == '\n') 
-        buf[l-1] = '\0';
+    printf("%s\n", C_RESET);
 }
 
-void trim_newline(char *s) {
-    if (!s) return; 
-    size_t l = strlen(s); 
-    if (l && s[l-1]=='\n') 
-        s[l-1]=0;
+static void print_side_borders(void) {
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    printf("%*s%s¦%*s¦%s\n", pad, "", C_B_BLUE, CONTAINER_WIDTH - 2, "", C_RESET);
 }
 
-void replace_commas(char *s) {
-    for (; *s; ++s) 
-        if (*s == ',') 
-            *s = ';';
+// Centered text within container
+static void print_centered_in_container(const char *s, const char *color) {
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    int text_pad = (CONTAINER_WIDTH - (int)strlen(s)) / 2;
+    if (text_pad < 0) text_pad = 0;
+    printf("%*s%s¦%*s%s%s%*s¦%s\n", 
+           pad, "", C_B_BLUE, 
+           text_pad, "", color, s, 
+           CONTAINER_WIDTH - 2 - text_pad - (int)strlen(s), "", 
+           C_RESET);
 }
 
-int parse_month(const char *date) {
-    int d,m,y; 
-    if (sscanf(date, "%d/%d/%d", &d, &m, &y) == 3) 
-        return m; 
-    return 0;
+// Left-aligned text within container
+static void print_left_in_container(const char *s, const char *color) {
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    printf("%*s%s¦ %s%s%*s¦%s\n", 
+           pad, "", C_B_BLUE, 
+           color, s, 
+           CONTAINER_WIDTH - 3 - (int)strlen(s), "", 
+           C_RESET);
 }
 
-int parse_year(const char *date) {
-    int d,m,y; 
-    if (sscanf(date, "%d/%d/%d", &d, &m, &y) == 3) 
-        return y; 
-    return 0;
+// Empty line in container
+static void print_empty_line_in_container(void) {
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    printf("%*s%s¦%*s¦%s\n", pad, "", C_B_BLUE, CONTAINER_WIDTH - 2, "", C_RESET);
 }
 
-int date_valid(const char *date) {
-    int d,m,y; 
-    if (sscanf(date, "%d/%d/%d", &d, &m, &y) != 3) 
-        return 0;
-    if (m<1||m>12) return 0; 
-    if (d<1||d>31) return 0; 
-    if (y<1900||y>9999) return 0;
+// Separator line in container
+static void print_separator_in_container(void) {
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    printf("%*s%s¦", pad, "", C_B_BLUE);
+    for (int i = 0; i < CONTAINER_WIDTH - 2; i++) printf("-");
+    printf("¦%s\n", C_RESET);
+}
+
+static void print_header(const char *title) {
+    system("clear || cls");
+    print_border_line(1);  // Top border
+    print_empty_line_in_container();
+    print_centered_in_container("==============================================", C_MAGENTA);
+    print_centered_in_container(title, C_BOLD C_MAGENTA);
+    print_centered_in_container("==============================================", C_MAGENTA);
+    print_empty_line_in_container();
+}
+
+static void print_footer(void) {
+    print_empty_line_in_container();
+    print_border_line(0);  // Bottom border
+}
+
+static void wait_enter_center(void) {
+    print_centered_in_container("(Press Enter to continue)", C_CYAN);
+    if (getchar() != '\n') while (getchar() != '\n');
+}
+
+static void print_error(const char* msg) {
+    print_centered_in_container(msg, C_B_RED);
+}
+
+static void print_success(const char* msg) {
+    print_centered_in_container(msg, C_B_GREEN);
+}
+
+static void get_input(const char *prompt, char *out, int sz) {
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    printf("%*s%s¦ %s: ", pad, "", C_B_BLUE, prompt);
+    printf("%s", C_RESET);
+    fflush(stdout);
+    if (!fgets(out, sz, stdin)) { out[0] = '\0'; return; }
+    out[strcspn(out, "\n")] = 0;
+}
+
+/* ---------- Utility functions: Core Logic ---------- */
+
+static void xor_str(char *s) {
+    for (int i = 0; s[i]; ++i) s[i] ^= XOR_KEY;
+}
+
+static int next_txn_id(void) {
+    int m = 0;
+    for (int i = 0; i < txn_count; ++i) if (txns[i].id > m) m = txns[i].id;
+    return m + 1;
+}
+
+static void txns_path(const char *user, char *out, int sz) {
+    snprintf(out, sz, "user_%s_txns.csv", user);
+}
+
+static void settings_path(const char *user, char *out, int sz) {
+    snprintf(out, sz, "user_%s_settings.txt", user);
+}
+
+static int is_valid_date(const char *d) {
+    int dd, mm, yy;
+    if (sscanf(d, "%d/%d/%d", &dd, &mm, &yy) != 3) return 0;
+    if (mm < 1 || mm > 12) return 0;
+    if (dd < 1 || dd > 31) return 0;
+    if (yy < 1900 || yy > 9999) return 0;
     return 1;
 }
 
-// Simple typing animation
-void type_print(const char *s, int ms_delay) {
-    const char *p;
-    for (p = s; *p; ++p) { 
-        putchar(*p); 
-        fflush(stdout); 
-        sleep_ms(ms_delay); 
+static void load_default_categories(void) {
+    const char *d[] = {"Salary","Business","Other Income","Grocery","Utilities","Transport","Dining & Food","Shopping","Healthcare","Others"};
+    cat_count = 0;
+    for (size_t i = 0; i < sizeof(d)/sizeof(d[0]) && cat_count < MAX_CATS; ++i) {
+        strncpy(cats[cat_count++], d[i], sizeof(cats[0])-1);
+        cats[cat_count-1][sizeof(cats[0])-1] = '\0';
     }
-    putchar('\n');
 }
 
-// Small spinner
-void spinner(int cycles) {
-    const char seq[] = "|/-\\";
-    int i;
-    for (i=0;i<cycles;i++) {
-        printf("\r%sLoading %c%s", CYAN, seq[i%4], RESET);
-        fflush(stdout); 
-        sleep_ms(100);
+static void add_category_session(const char *name) {
+    if (cat_count < MAX_CATS) {
+        strncpy(cats[cat_count++], name, sizeof(cats[0])-1);
+        cats[cat_count-1][sizeof(cats[0])-1] = '\0';
     }
-    printf("\r                     \r");
 }
 
-// ---------------------- XOR password ----------------------
+/* ---------- UI: Animation/UX Improvement (Loading Bar) ---------- */
 
-// XOR key -- single char; ok for obfuscation at PF-level
-static const char XOR_KEY = 0x5A;
-
-void xor_obfuscate(char *s) {
-	int i;
-    for (i=0; s[i]; ++i) 
-        s[i] ^= XOR_KEY;
-}
-
-// ---------------------- TxnList management ----------------------
-
-void init_txnlist(TxnList *t) { 
-    t->arr = NULL; 
-    t->size = 0; 
-    t->cap = 0; 
-}
-
-void free_txnlist(TxnList *t) { 
-    free(t->arr); 
-    t->arr = NULL; 
-    t->size = t->cap = 0; 
-}
-
-void ensure_txncap(TxnList *t, int need) {
-    if (t->cap >= need) return;
-    int nc = t->cap ? t->cap*2 : 8; 
-    if (nc < need) nc = need;
-    Transaction *tmp = realloc(t->arr, sizeof(Transaction)*nc);
-    if (!tmp) { 
-        printf("Memory error\n"); 
-        exit(1); 
+static void welcome_animation(const char *username_display) {
+    print_header("Personal Budget Tracker");
+    if (username_display && username_display[0]) {
+        char hello[128]; snprintf(hello, sizeof(hello), "Hello, %s", username_display);
+        print_centered_in_container(hello, C_CYAN);
+    } else {
+        print_centered_in_container("Hello, User", C_CYAN);
     }
-    t->arr = tmp; 
-    t->cap = nc;
-}
-
-void push_txn(TxnList *t, Transaction tx) { 
-    ensure_txncap(t, t->size+1); 
-    t->arr[t->size++] = tx; 
-}
-
-int next_txn_id(TxnList *t) {
-    int i, mx = 0; 
-    for (i=0;i<t->size;i++) 
-        if (t->arr[i].id > mx) 
-            mx = t->arr[i].id;
-    return mx + 1;
-}
-
-// ---------------------- File paths ----------------------
-
-void user_transactions_file(const char *username, char *out, size_t outsz) {
-    snprintf(out, outsz, "user_%s.csv", username);
-}
-
-void user_settings_file(const char *username, char *out, size_t outsz) {
-    snprintf(out, outsz, "user_%s_settings.txt", username);
-}
-
-// ---------------------- Users management (XOR encrypted pass) ----------------------
-
-int user_exists(const char *username) {
-    FILE *f = fopen(USERS_FILE, "r"); 
-    if (!f) return 0;
-    char line[MAX_LINE];
-    while (fgets(line, sizeof(line), f)) {
-        trim_newline(line);
-        if (strlen(line)==0) continue;
-        // CSV: id,username,encpass
-        char *p = strchr(line, ','); 
-        if (!p) continue;
-        p++;
-        char uname[64]; 
-        int id; // read until next comma
-        sscanf(p, "%63[^,],", uname);
-        if (strcmp(uname, username) == 0) { 
-            fclose(f); 
-            return 1; 
-        }
+    
+    // Loading Bar Animation
+    print_empty_line_in_container();
+    int bar_width = 40;
+    int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
+    printf("%*s%s¦", pad, "", C_B_BLUE);
+    for (int i = 0; i <= bar_width; ++i) {
+        printf("\r%*s%s¦%*s%s[", pad, "", C_B_BLUE, (CONTAINER_WIDTH - bar_width - 4) / 2, "", C_CYAN);
+        for (int j = 0; j < i; ++j) printf("#");
+        for (int j = i; j < bar_width; ++j) printf("-");
+        printf("]%s", C_RESET);
+        fflush(stdout);
+        sleep_ms(30);
     }
-    fclose(f); 
-    return 0;
+    printf("%*s%s¦%s\n", CONTAINER_WIDTH - bar_width - 6, "", C_B_BLUE, C_RESET);
+    sleep_ms(150);
+    print_footer();
 }
 
-// generate next user id
-int next_user_id() {
-    FILE *f = fopen(USERS_FILE, "r"); 
-    if (!f) return 1;
-    char line[MAX_LINE]; 
-    int last = 0;
-    while (fgets(line, sizeof(line), f)) {
-        int id; 
-        if (sscanf(line, "%d,", &id) == 1) 
-            last = id;
-    }
-    fclose(f); 
-    return last+1;
-}
+/* ---------- File I/O (Authentication, Transactions, Settings) ---------- */
 
-int register_user(const char *username, const char *password) {
-    if (user_exists(username)) return 0;
-    User u; 
-    u.id = next_user_id(); 
-    strncpy(u.username, username, sizeof(u.username)-1);
-    strncpy(u.password_enc, password, sizeof(u.password_enc)-1);
-    xor_obfuscate(u.password_enc);
-    FILE *f = fopen(USERS_FILE, "a");
-    if (!f) return 0;
-    // write CSV: id,username,encpass
-    fprintf(f, "%d,%s,%s\n", u.id, u.username, u.password_enc);
-    fclose(f);
-    // create empty user files
-    char path[256];
-    user_transactions_file(username, path, sizeof(path));
-    FILE *g = fopen(path, "w"); 
-    if (g) fclose(g);
-    user_settings_file(username, path, sizeof(path));
-    g = fopen(path, "w"); 
-    if (g) { 
-        fprintf(g,"budget_limit:0.00\n"); 
-        fclose(g); 
-    }
-    return 1;
-}
-
-int verify_user(const char *username, const char *password) {
-    FILE *f = fopen(USERS_FILE, "r"); 
+static int verify_user_file(const char *username, const char *password) {
+    FILE *f = fopen(USERS_CSV, "r");
     if (!f) return 0;
     char line[MAX_LINE];
     int ok = 0;
     while (fgets(line, sizeof(line), f)) {
-        trim_newline(line); 
-        if (strlen(line)==0) continue;
-        int id; 
-        char uname[64], enc[128];
-        // parse id,username,enc
-        char *p1 = strtok(line, ","); 
-        char *p2 = strtok(NULL, ","); 
-        char *p3 = strtok(NULL, ",");
-        if (!p1 || !p2 || !p3) continue;
-        id = atoi(p1); 
-        strncpy(uname, p2, sizeof(uname)-1); 
-        uname[sizeof(uname)-1]=0;
-        strncpy(enc, p3, sizeof(enc)-1); 
-        enc[sizeof(enc)-1]=0;
-        if (strcmp(uname, username) == 0) {
-            // de-obfuscate a copy
-            char test[128]; 
-            strncpy(test, enc, sizeof(test)-1);
-            xor_obfuscate(test);
-            if (strcmp(test, password) == 0) ok = 1;
-            break;
+        char u[64], penc[128];
+        if (sscanf(line, "%63[^,],%127[^\n]", u, penc) == 2) {
+            if (strcmp(u, username) == 0) {
+                char dec[128]; strncpy(dec, penc, sizeof(dec)-1); dec[sizeof(dec)-1]='\0'; xor_str(dec);
+                if (strcmp(dec, password) == 0) ok = 1;
+                break;
+            }
         }
     }
-    fclose(f); 
+    fclose(f);
     return ok;
 }
 
-int change_user_password(const char *username, const char *oldpass, const char *newpass) {
-    // verify first
-    if (!verify_user(username, oldpass)) return 0;
-    FILE *f = fopen(USERS_FILE, "r"); 
+static int user_exists(const char *username) {
+    FILE *f = fopen(USERS_CSV, "r");
     if (!f) return 0;
-    FILE *g = fopen("users_tmp.csv", "w"); 
-    if (!g) { 
-        fclose(f); 
-        return 0; 
-    }
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
-        trim_newline(line); 
-        if (strlen(line)==0) continue;
-        char copy[MAX_LINE]; 
-        strncpy(copy, line, sizeof(copy)-1);
-        char *p1 = strtok(copy, ","); 
-        char *p2 = strtok(NULL, ","); 
-        char *p3 = strtok(NULL, ",");
-        if (!p1 || !p2) continue;
-        if (strcmp(p2, username) == 0) {
-            char encnew[128]; 
-            strncpy(encnew, newpass, sizeof(encnew)-1); 
-            xor_obfuscate(encnew);
-            fprintf(g, "%s,%s,%s\n", p1, p2, encnew);
-        } else {
-            // write original line
-            fprintf(g, "%s\n", line);
+        char u[64];
+        if (sscanf(line, "%63[^,],%*[^\n]", u) == 1) {
+            if (strcmp(u, username) == 0) { fclose(f); return 1; }
         }
     }
-    fclose(f); 
-    fclose(g);
-    remove(USERS_FILE); 
-    rename("users_tmp.csv", USERS_FILE);
-    return 1;
+    fclose(f); return 0;
 }
 
-// ---------------------- Transactions load/save ----------------------
+static int save_transactions_for_user(const char *username) {
+    char path[MAX_LINE]; txns_path(username, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) return 0;
+    for (int i = 0; i < txn_count; ++i) {
+        Transaction *t = &txns[i];
+        // Ensure note does not contain commas by replacing with semi-colons (maintains CSV integrity)
+        char safe_note[192]; strncpy(safe_note, t->note, sizeof(safe_note)-1); safe_note[sizeof(safe_note)-1]='\0';
+        for (int j=0; safe_note[j]; ++j) if (safe_note[j] == ',') safe_note[j] = ';';
+        fprintf(f, "%d,%s,%s,%.2f,%02d/%02d/%04d,%s\n", 
+                t->id, t->type, t->category, t->amount, t->day, t->month, t->year, safe_note);
+    }
+    fclose(f); return 1;
+}
 
-void load_transactions(const char *username, TxnList *list) {
-    init_txnlist(list);
-    char path[256]; 
-    user_transactions_file(username, path, sizeof(path));
-    FILE *f = fopen(path, "r"); 
+static void load_transactions_for_user(const char *username) {
+    txn_count = 0;
+    char path[MAX_LINE]; txns_path(username, path, sizeof(path));
+    FILE *f = fopen(path, "r");
     if (!f) return;
     char line[MAX_LINE];
-    while (fgets(line, sizeof(line), f)) {
-        trim_newline(line); 
-        if (strlen(line) == 0) continue;
-        // CSV: id,type,category,amount,date,note
-        Transaction t; 
-        char *tok = strtok(line, ","); 
-        if (!tok) continue; 
-        t.id = atoi(tok);
-        tok = strtok(NULL, ","); 
-        if (!tok) continue; 
-        strncpy(t.type, tok, sizeof(t.type)-1);
-        tok = strtok(NULL, ","); 
-        if (!tok) continue; 
-        strncpy(t.category, tok, sizeof(t.category)-1);
-        tok = strtok(NULL, ","); 
-        if (!tok) continue; 
-        t.amount = atof(tok);
-        tok = strtok(NULL, ","); 
-        if (!tok) continue; 
-        strncpy(t.date, tok, sizeof(t.date)-1);
-        tok = strtok(NULL, ""); 
-        if (tok) { 
-            trim_newline(tok); 
-            strncpy(t.note, tok, sizeof(t.note)-1); 
-        } else 
-            t.note[0] = '\0';
-        push_txn(list, t);
+    while (fgets(line, sizeof(line), f) && txn_count < MAX_TXNS) {
+        Transaction t; memset(&t, 0, sizeof(t));
+        if (sscanf(line, "%d,%11[^,],%63[^,],%lf,%d/%d/%d,%191[^\n]", 
+                   &t.id, t.type, t.category, &t.amount, 
+                   &t.day, &t.month, &t.year, t.note) == 8) {
+            txns[txn_count++] = t;
+        }
     }
     fclose(f);
 }
 
-int save_transactions(const char *username, TxnList *list) {
-    char path[256]; 
-    user_transactions_file(username, path, sizeof(path));
-    FILE *f = fopen(path, "w"); 
-    if (!f) return 0;
-    int i;
-    for (i=0;i<list->size;i++) {
-        Transaction *t = &list->arr[i]; 
-        char note_safe[256]; 
-        strncpy(note_safe, t->note, sizeof(note_safe)-1);
-        replace_commas(note_safe);
-        fprintf(f, "%d,%s,%s,%.2f,%s,%s\n", t->id, t->type, t->category, t->amount, t->date, note_safe);
-    }
-    fclose(f); 
-    return 1;
-}
-
-// Settings
-double load_budget_limit(const char *username) {
-    char path[256]; 
-    user_settings_file(username, path, sizeof(path));
-    FILE *f = fopen(path, "r"); 
-    if (!f) return 0.0;
-    char line[256]; 
-    double lim = 0.0;
-    if (fgets(line, sizeof(line), f)) {
-        char *p = strchr(line, ':'); 
-        if (p) lim = atof(p+1);
-    }
-    fclose(f); 
-    return lim;
-}
-
-void save_budget_limit(const char *username, double v) {
-    char path[256]; 
-    user_settings_file(username, path, sizeof(path));
-    FILE *f = fopen(path, "w"); 
+static void load_settings_for_user(const char *username) {
+    monthly_budget = 0.0;
+    char path[MAX_LINE]; settings_path(username, path, sizeof(path));
+    FILE *f = fopen(path, "r");
     if (!f) return;
-    fprintf(f, "budget_limit:%.2f\n", v);
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "budget:%lf", &monthly_budget) == 1) break;
+    }
     fclose(f);
 }
 
-// ---------------------- Categories (defaults) ----------------------
-
-int load_default_categories(char cats[][MAX_CAT_LEN]) {
-    const char *defs[] = {
-        "Grocery", "Utilities", "Transportation", 
-        "Dining & Food", "Shopping", "Others"
-    };
-    int n = sizeof(defs)/sizeof(defs[0]);
-    int i;
-    for (i=0;i<n;i++) 
-        strncpy(cats[i], defs[i], MAX_CAT_LEN-1);
-    return n;
+static void save_settings_for_user(const char *username) {
+    char path[MAX_LINE]; settings_path(username, path, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "budget:%.2f\n", monthly_budget);
+    fclose(f);
 }
 
-// ---------------------- UI Boxes ----------------------
+/* ---------- Business rules (Calculations) ---------- */
 
-void print_box(const char *title, const char *lines[], int nlines, const char *color) {
-    printf("%s", color);
-    printf("+"); 
-    int i,j;
-    for (i=0;i<60;i++) putchar('-'); 
-    printf("+\n");
-    int pad = (60 - (int)strlen(title)) / 2;
-    printf("Â¦"); 
-    for (i=0;i<pad;i++) putchar(' '); 
-    printf("%s", title);
-    for (i=0;i<60 - pad - (int)strlen(title); i++) putchar(' '); 
-    printf("Â¦\n");
-    printf("+"); 
-    for (i=0;i<60;i++) putchar('-'); 
-    printf("Â¦\n");
-    for (i=0;i<nlines;i++) {
-        printf("Â¦ "); 
-        printf("%s", lines[i]);
-        for (j=0;j<58 - (int)strlen(lines[i]); j++) putchar(' ');
-        printf(" Â¦\n");
-    }
-    printf("+"); 
-    for (i=0;i<60;i++) putchar('-'); 
-    printf("+\n");
-    printf(RESET);
+static double sum_income_month(int m, int y) {
+    double s = 0.0;
+    for (int i = 0; i < txn_count; ++i)
+        if (strcmp(txns[i].type, "Income") == 0 && txns[i].month == m && txns[i].year == y)
+            s += txns[i].amount;
+    return s;
 }
 
-void header_anim(const char *username) {
-    clear_screen();
-    printf(BOLD CYAN);
-    type_print("==============================================", 1);
-    type_print("           Welcome to Budget Tracker          ", 1);
-    type_print("==============================================", 1);
-    printf(RESET);
-    printf(GREEN "Hello, %s\n\n" RESET, username);
-    spinner(6);
+static double sum_expense_month(int m, int y) {
+    double s = 0.0;
+    for (int i = 0; i < txn_count; ++i)
+        if (strcmp(txns[i].type, "Expense") == 0 && txns[i].month == m && txns[i].year == y)
+            s += txns[i].amount;
+    return s;
 }
-// ---------------------- Add flows ----------------------
 
-// check income duplicate for same category and month/year
-int income_duplicate(TxnList *list, const char *category, const char *date) {
-    int m = parse_month(date), y = parse_year(date);
-    if (!m || !y) return 0;
-    int i;
-    for (i=0;i<list->size;i++) {
-        if (strcmp(list->arr[i].type, "Income")==0 && 
-            strcmp(list->arr[i].category, category)==0) {
-            int im = parse_month(list->arr[i].date), iy = parse_year(list->arr[i].date);
-            if (im == m && iy == y) return 1;
-        }
-    }
+static int salary_exists_in_month(int m, int y) {
+    for (int i = 0; i < txn_count; ++i)
+        if (strcmp(txns[i].type, "Income") == 0 && strcmp(txns[i].category, "Salary") == 0 && txns[i].month == m && txns[i].year == y)
+            return 1;
     return 0;
 }
 
-void add_income(TxnList *list) {
-    Transaction t; 
-    char buf[256];
-    t.id = next_txn_id(list); 
-    strncpy(t.type, "Income", sizeof(t.type)-1);
-    printf("Enter income category (e.g., Salary): ");
-    safe_input(buf, sizeof(buf)); 
-    if (strlen(buf)==0) 
-        strncpy(t.category, "Salary", sizeof(t.category)-1); 
-    else 
-        strncpy(t.category, buf, sizeof(t.category)-1);
-    
-    printf("Enter amount: "); 
-    safe_input(buf, sizeof(buf)); 
-    t.amount = atof(buf);
-    
-    printf("Enter date (DD/MM/YYYY) leave blank for today: "); 
-    safe_input(buf, sizeof(buf));
-    if (strlen(buf)==0) {
-        time_t tt = time(NULL); 
-        struct tm *tm = localtime(&tt);
-        snprintf(t.date, sizeof(t.date), "%02d/%02d/%04d", tm->tm_mday, tm->tm_mon+1, tm->tm_year+1900);
-    } else {
-        if (!date_valid(buf)) { 
-            printf(RED "Invalid date. Aborted.\n" RESET); 
-            return; 
-        }
-        strncpy(t.date, buf, sizeof(t.date)-1);
-    }
-    // duplicate check
-    if (income_duplicate(list, t.category, t.date)) { 
-        printf(RED "Income already added for this category in this month.\n" RESET); 
-        return; 
-    }
-    
-    printf("Enter note (optional): "); 
-    safe_input(buf, sizeof(buf)); 
-    strncpy(t.note, buf, sizeof(t.note)-1);
-    push_txn(list, t); 
-    printf(GREEN "Income added (ID %d)\n" RESET, t.id);
-}
-
-void add_expense(TxnList *list, char cats[][MAX_CAT_LEN], int *catcount) {
-    Transaction t; 
-    char buf[256];
-    int i;
-    t.id = next_txn_id(list); 
-    strncpy(t.type, "Expense", sizeof(t.type)-1);
-    printf("Choose category number or 0 for custom:\n");
-    for (i=0;i<*catcount;i++) 
-        printf(" %d. %s\n", i+1, cats[i]);
-    printf(" 0. Custom\nChoice: "); 
-    safe_input(buf, sizeof(buf));
-    int ch = atoi(buf);
-    if (ch==0) { 
-        printf("Enter custom category name: "); 
-        safe_input(buf, sizeof(buf)); 
-        if (strlen(buf)==0) 
-            strncpy(t.category,"Others",sizeof(t.category)-1); 
-        else { 
-            strncpy(t.category, buf, sizeof(t.category)-1); 
-            if (*catcount < MAX_CATS) { 
-                strncpy(cats[*catcount], buf, MAX_CAT_LEN-1); 
-                (*catcount)++; 
-            } 
-        } 
-    } else { 
-        if (ch <1 || ch > *catcount) { 
-            printf(RED "Invalid\n" RESET); 
-            return; 
-        } 
-        strncpy(t.category, cats[ch-1], sizeof(t.category)-1); 
-    }
-    
-    printf("Enter amount: "); 
-    safe_input(buf, sizeof(buf)); 
-    t.amount = atof(buf);
-    
-    printf("Enter date (DD/MM/YYYY) leave blank for today: "); 
-    safe_input(buf, sizeof(buf));
-    if (strlen(buf)==0) { 
-        time_t tt = time(NULL); 
-        struct tm *tm = localtime(&tt); 
-        snprintf(t.date, sizeof(t.date), "%02d/%02d/%04d", tm->tm_mday, tm->tm_mon+1, tm->tm_year+1900); 
-    } else { 
-        if (!date_valid(buf)) { 
-            printf(RED "Invalid date.\n" RESET); 
-            return; 
-        } 
-        strncpy(t.date, buf, sizeof(t.date)-1); 
-    }
-    
-    printf("Enter note (optional): "); 
-    safe_input(buf, sizeof(buf)); 
-    strncpy(t.note, buf, sizeof(t.note)-1);
-    push_txn(list, t); 
-    printf(GREEN "Expense added (ID %d)\n" RESET, t.id);
-}
-
-// ---------------------- Show / edit / delete ----------------------
-
-void show_transactions(TxnList *list) {
-    if (list->size==0) { 
-        printf("No transactions.\n"); 
-        return; 
-    }
-    printf(BOLD "---------------------------------------------------------------\n" RESET);
-    printf(BOLD " ID | DATE       | TYPE     | CATEGORY          | AMOUNT    | NOTE\n" RESET);
-    printf(BOLD "---------------------------------------------------------------\n" RESET);
-    double inc = 0, exp = 0;
-    int i;
-    for (i=0;i<list->size;i++) {
-        Transaction *t = &list->arr[i];
-        printf("%3d | %-10s | %-8s | %-16s | %9.2f | %s\n", 
-               t->id, t->date, t->type, t->category, t->amount, 
-               strlen(t->note)?t->note:"NA");
-        if (strcmp(t->type, "Income")==0) 
-            inc += t->amount; 
-        else 
-            exp += t->amount;
-    }
-    printf(BOLD "---------------------------------------------------------------\n" RESET);
-    printf("Total Income : Rs. %.2f\nTotal Expense: Rs. %.2f\nSavings      : Rs. %.2f\n", inc, exp, inc-exp);
-}
-
-Transaction* find_txn(TxnList *list, int id) {
-	int i;
-    for (i=0;i<list->size;i++) 
-        if (list->arr[i].id == id) 
-            return &list->arr[i];
+static Transaction* find_txn_by_id(int id) {
+    for (int i = 0; i < txn_count; ++i) if (txns[i].id == id) return &txns[i];
     return NULL;
 }
 
-void edit_transaction(TxnList *list) {
-    if (list->size==0) { 
-        printf("No records.\n"); 
-        return; 
-    }
-    char buf[128]; 
-    printf("Enter transaction ID to edit: "); 
-    safe_input(buf, sizeof(buf)); 
-    int id = atoi(buf);
-    Transaction *t = find_txn(list, id); 
-    if (!t) { 
-        printf(RED "Not found\n" RESET); 
-        return; 
-    }
-    printf("Current: ID %d | %s | %s | %s | %.2f | %s\n", 
-           t->id, t->date, t->type, t->category, t->amount, t->note);
-    printf("Enter field to edit: 1-Type 2-Category 3-Amount 4-Date 5-Note 0-Cancel: "); 
-    safe_input(buf, sizeof(buf));
-    int ch = atoi(buf);
-    if (ch==0) return;
-    printf("Enter new value: "); 
-    safe_input(buf, sizeof(buf));
-    if (ch==1) 
-        strncpy(t->type, buf, sizeof(t->type)-1);
-    else if (ch==2) 
-        strncpy(t->category, buf, sizeof(t->category)-1);
-    else if (ch==3) 
-        t->amount = atof(buf);
-    else if (ch==4) { 
-        if (!date_valid(buf)) { 
-            printf(RED "Invalid date\n" RESET); 
-            return; 
-        } 
-        strncpy(t->date, buf, sizeof(t->date)-1); 
-    }
-    else if (ch==5) 
-        strncpy(t->note, buf, sizeof(t->note)-1);
-    printf(GREEN "Updated.\n" RESET);
+static int delete_txn_by_id(int id) {
+    int idx = -1;
+    for (int i = 0; i < txn_count; ++i) if (txns[i].id == id) { idx = i; break; }
+    if (idx == -1) return 0;
+    for (int j = idx; j < txn_count - 1; ++j) txns[j] = txns[j + 1];
+    txn_count--;
+    return 1;
 }
 
-void delete_transaction(TxnList *list) {
-    if (list->size==0) { 
-        printf("No records.\n"); 
-        return; 
-    }
-    char buf[128]; 
-    printf("Enter transaction ID to delete: "); 
-    safe_input(buf, sizeof(buf)); 
-    int id = atoi(buf);
-    int idx = -1; 
-    int i,j;
-    for (i=0;i<list->size;i++) 
-        if (list->arr[i].id==id) { 
-            idx=i; break; 
+static void get_transaction_details(Transaction *t) {
+    char tmp[64];
+    get_input("Enter amount", tmp, sizeof(tmp)); 
+    t->amount = atof(tmp);
+    if (t->amount <= 0) { print_error("Invalid amount."); return; }
+    get_input("Enter note (optional)", t->note, sizeof(t->note));
+}
+
+/* ---------- Add Transaction Flow ---------- */
+
+void add_transaction_flow_with_month(int m_pref, int y_pref) {
+    if (txn_count >= MAX_TXNS) { print_error("Transaction limit reached."); wait_enter_center(); return; }
+
+    while (1) {
+        print_header("ADD TRANSACTION");
+        print_left_in_container("1) Add Income", C_RESET);
+        print_left_in_container("2) Add Expense", C_RESET);
+        print_left_in_container("0) Back", C_RESET);
+        print_empty_line_in_container();
+        print_left_in_container("Enter choice:", C_RESET);
+        char ch[16]; get_input("Choice", ch, sizeof(ch));
+        if (ch[0] == '0') { print_footer(); return; }
+
+        Transaction t; memset(&t,0,sizeof(t)); t.id = next_txn_id();
+        int is_income = (ch[0] == '1');
+        strncpy(t.type, is_income ? "Income" : "Expense", sizeof(t.type)-1);
+        t.type[sizeof(t.type)-1] = '\0';
+
+        // Date selection
+        char datebuf[16], tmp[64];
+        if (m_pref && y_pref) {
+            get_input("Enter day of month (1-31) or empty for 1", tmp, sizeof(tmp));
+            int dd = tmp[0] ? atoi(tmp) : 1;
+            if (dd < 1 || dd > 31) dd = 1;
+            snprintf(datebuf, sizeof(datebuf), "%02d/%02d/%04d", dd, m_pref, y_pref);
+        } else {
+            get_input("Enter date (DD/MM/YYYY) or empty for today", tmp, sizeof(tmp));
+            if (tmp[0] == 0) { 
+                time_t time_now = time(NULL); struct tm *tm = localtime(&time_now);
+                snprintf(datebuf, sizeof(datebuf), "%02d/%02d/%04d", tm->tm_mday, tm->tm_mon + 1, tm->tm_year + 1900);
+            } else if (!is_valid_date(tmp)) { 
+                print_error("Invalid date."); wait_enter_center(); continue; 
+            } else { strncpy(datebuf, tmp, sizeof(datebuf)-1); datebuf[sizeof(datebuf)-1] = '\0'; }
         }
-    if (idx==-1) { 
-        printf(RED "Not found\n" RESET); 
-        return; 
+        if (sscanf(datebuf,"%d/%d/%d",&t.day,&t.month,&t.year) != 3) { print_error("Date processing error."); wait_enter_center(); continue; }
+
+        // Category selection
+        print_centered_in_container(is_income ? "Choose income category:" : "Choose expense category:", C_RESET);
+        int sel_idxs[MAX_CATS], sel_count=0;
+        for (int i=0; i<cat_count; i++) {
+            int is_inc_cat = (strcasecmp(cats[i], "Salary")==0 || strcasecmp(cats[i], "Business")==0 || strcasecmp(cats[i], "Other Income")==0);
+            if (is_income == is_inc_cat) {
+                char b[80]; snprintf(b,sizeof(b), "%d) %s", sel_count+1, cats[i]); print_left_in_container(b, C_RESET);
+                sel_idxs[sel_count++] = i;
+            }
+        }
+        print_left_in_container("0) Custom", C_RESET);
+        get_input("Enter choice number", tmp, sizeof(tmp));
+        int sel_idx = atoi(tmp);
+
+        if (sel_idx == 0) {
+            get_input(is_income ? "Enter custom income category" : "Enter custom expense category", t.category, sizeof(t.category));
+            if (t.category[0]) add_category_session(t.category);
+        } else if (sel_idx > 0 && sel_idx <= sel_count) {
+            strncpy(t.category, cats[sel_idxs[sel_idx-1]], sizeof(t.category)-1);
+            t.category[sizeof(t.category)-1] = '\0';
+        } else {
+            print_error("Invalid selection."); wait_enter_center(); continue;
+        }
+
+        get_transaction_details(&t);
+        if (t.amount <= 0) continue;
+
+        // Validation checks
+        if (is_income && strcasecmp(t.category, "Salary") == 0 && salary_exists_in_month(t.month, t.year)) {
+            print_error("Salary already added for this month. Cannot add another.");
+            wait_enter_center(); continue;
+        }
+        if (!is_income) {
+            double inc = sum_income_month(t.month, t.year);
+            if (inc <= 0.0) { print_error("Cannot add expense: no income recorded for this month."); wait_enter_center(); continue; }
+            double ex_before = sum_expense_month(t.month, t.year);
+            if (ex_before + t.amount > inc) {
+                print_centered_in_container("Warning: Expense exceeds income for the month.", C_YELLOW);
+                get_input("Proceed? (Y/N)", tmp, sizeof(tmp));
+                if (!(tmp[0]=='Y' || tmp[0]=='y')) { print_error("Cancelled."); wait_enter_center(); continue; }
+            }
+            if (monthly_budget > 0.0 && ex_before + t.amount > monthly_budget) {
+                print_centered_in_container("Alert: Expense crosses monthly budget!", C_B_RED);
+            }
+        }
+
+        txns[txn_count++] = t;
+        save_transactions_for_user(cur_user);
+        print_success(is_income ? "Income added successfully." : "Expense added successfully.");
+        wait_enter_center();
+        break; 
     }
-    for (j=idx;j<list->size-1;j++) 
-        list->arr[j] = list->arr[j+1];
-    list->size--;
-    printf(GREEN "Deleted.\n" RESET);
+    print_footer();
 }
 
-// ---------------------- Manage Categories ----------------------
-
-void manage_categories(char cats[][MAX_CAT_LEN], int *catcount) {
-    int choice;
-    char buf[256];
-    
-    do {
-        printf("\n=== MANAGE CATEGORIES ===\n");
-        printf("1. View Categories\n");
-        printf("2. Add Category\n");
-        printf("3. Back to Main Menu\n");
-        printf("Choice: ");
-        safe_input(buf, sizeof(buf));
-        choice = atoi(buf);
-		switch(choice) {
-            case 1:
-                printf("\n=== CURRENT CATEGORIES ===\n");
-                int i;
-                for ( i = 0; i < *catcount; i++) {
-                    printf("%d. %s\n", i+1, cats[i]);
-                }
-                break;
-                
-            case 2:
-                if (*catcount >= MAX_CATS) {
-                    printf(RED "Category limit reached!\n" RESET);
-                    break;
-                }
-                printf("Enter new category name: ");
-                safe_input(buf, sizeof(buf));
-                if (strlen(buf) > 0) {
-                    // Check for duplicate
-                    int i,duplicate = 0;
-                    for (i = 0; i < *catcount; i++) {
-                        if (strcmp(cats[i], buf) == 0) {
-                            duplicate = 1;
-                            break;
-                        }
-                    }
-                    if (!duplicate) {
-                        strncpy(cats[*catcount], buf, MAX_CAT_LEN-1);
-                        (*catcount)++;
-                        printf(GREEN "Category added successfully!\n" RESET);
-                    } else {
-                        printf(RED "Category already exists!\n" RESET);
-                    }
-                }
-                break;
-                
-            case 3:
+/* ---------- Authentication Menu (Entry point) ---------- */
+static void auth_menu(void) {
+    while (1) {
+        print_header("AUTHENTICATION");
+        print_left_in_container("1) Login", C_RESET);
+        print_left_in_container("2) Register", C_RESET);
+        print_left_in_container("3) Exit", C_RESET);
+        print_empty_line_in_container();
+        print_left_in_container("Enter choice (1-3):", C_RESET);
+        
+        char buf[32], u[64], p[128]; 
+        get_input("Choice", buf, sizeof(buf));
+        
+        if (buf[0] == '1') {
+            print_header("LOGIN");
+            get_input("Enter username", u, sizeof(u));
+            get_input("Enter password", p, sizeof(p));
+            welcome_animation(NULL);
+            if (verify_user_file(u, p)) {
+                strncpy(cur_user, u, sizeof(cur_user)-1); cur_user[sizeof(cur_user)-1] = '\0';
+                load_default_categories();
+                load_transactions_for_user(cur_user);
+                load_settings_for_user(cur_user);
+                welcome_animation(cur_user);
                 return;
-                
-            default:
-                printf(RED "Invalid choice!\n" RESET);
-        }
-    } while (choice != 3);
-}
-
-// ---------------------- Summaries & Health ----------------------
-
-void financial_health(TxnList *list, int month, int year) {
-    double income = 0, expense = 0;
-    // category sums
-    char cats[50][MAX_CAT_LEN]; 
-    double vals[50]; 
-    int ccount=0;
-    int i,j;
-    for (i=0;i<list->size;i++) {
-        Transaction *t = &list->arr[i];
-        int m = parse_month(t->date), y = parse_year(t->date);
-        if (m!=month || y!=year) continue;
-        
-        if (strcmp(t->type, "Income")==0) {
-            income += t->amount;
-        } else {
-            expense += t->amount;
-            int found = -1;
-            for (j=0;j<ccount;j++) {
-                if (strcmp(cats[j], t->category)==0) { 
-                    found = j; 
-                    break; 
-                }
-            }
-            if (found == -1) { 
-                if (ccount < 50) { 
-                    strncpy(cats[ccount], t->category, MAX_CAT_LEN-1); 
-                    vals[ccount] = t->amount; 
-                    ccount++; 
-                }
             } else {
-                vals[found] += t->amount;
+                print_error("Login failed. Invalid credentials.");
+                wait_enter_center();
             }
+        } else if (buf[0] == '2') {
+            print_header("REGISTER");
+            get_input("Choose a username", u, sizeof(u));
+            if (user_exists(u)) { print_error("Username already exists."); wait_enter_center(); continue; }
+            get_input("Choose a password", p, sizeof(p));
+            if (u[0] && p[0]) {
+                char enc[128]; strncpy(enc, p, sizeof(enc)-1); enc[sizeof(enc)-1] = '\0'; xor_str(enc);
+                FILE *f = fopen(USERS_CSV, "a");
+                if (f) {
+                    fprintf(f, "%s,%s\n", u, enc); fclose(f);
+                    char path[MAX_LINE];
+                    txns_path(u, path, sizeof(path));
+                    FILE *g = fopen(path, "w"); if (g) fclose(g);
+                    settings_path(u, path, sizeof(path));
+                    g = fopen(path, "w"); if (g) { fprintf(g, "budget:0.00\n"); fclose(g); }
+                    print_success("Registered successfully. Please login.");
+                } else { print_error("Registration failed (file error)."); }
+            } else { print_error("Username and password cannot be empty."); }
+            wait_enter_center();
+        } else if (buf[0] == '3' || buf[0] == '0') {
+            print_header("Goodbye."); exit(0);
+        } else {
+            print_error("Invalid choice."); wait_enter_center();
         }
+        print_footer();
     }
-    
-    printf("\nFinancial overview: Income Rs. %.2f | Expense Rs. %.2f | Savings Rs. %.2f\n", 
-           income, expense, income-expense);
-    printf("Health: ");
-    
-    if (expense > income) { 
-        printf(RED "Danger - expenses exceed income\n" RESET); 
-        printf("Tip: Reduce discretionary spending, prioritize essential bills.\n"); 
-    } else {
-        double ratio = (income > 0) ? (expense/income*100.0) : 0;
-        if (ratio > 80) { 
-            printf(RED "Risk - high spending (%.1f%% of income)\n" RESET, ratio); 
-            printf("Tip: Cut shopping/dining, track subscriptions.\n"); 
-        } else if (ratio > 50) { 
-            printf(YELLOW "Caution - moderate spending (%.1f%%)\n" RESET, ratio); 
-            printf("Tip: Review recurring expenses.\n"); 
-        } else { 
-            printf(GREEN "Healthy (%.1f%%)\n" RESET, ratio); 
-            printf("Tip: Maintain savings and consider goals.\n"); 
-        }
-    }
-    
-    if (ccount>0) {
-        // sort top categories (bubble sort)
-        int i,j;
-        for (i=0;i<ccount-1;i++) {
-            for (j=0;j<ccount-i-1;j++) {
-                if (vals[j] < vals[j+1]) {
-                    // swap values
-                    double temp_val = vals[j];
-                    vals[j] = vals[j+1];
-                    vals[j+1] = temp_val;
-                    
-                    // swap categories
-                    char temp_cat[MAX_CAT_LEN];
-                    strcpy(temp_cat, cats[j]);
-                    strcpy(cats[j], cats[j+1]);
-                    strcpy(cats[j+1], temp_cat);
-                }
-            }
-        }
+}
+
+/* ---------- Dashboard Menu ---------- */
+void dashboard_menu(void) {
+    while (1) {
+        print_header("DASHBOARD");
+        print_left_in_container("1) View Month Summary", C_RESET);
+        print_left_in_container("2) Add Transaction (for specific month)", C_RESET);
+        print_left_in_container("3) View Recent Transactions", C_RESET);
+        print_left_in_container("0) Back to Main Menu", C_RESET);
+        print_empty_line_in_container();
+        print_left_in_container("Enter choice:", C_RESET);
         
-        printf("\nTop spending categories:\n");
-        int limit = (ccount < 3) ? ccount : 3;
-        for (i=0; i < limit; i++) {
-            printf("%d) %s - Rs. %.2f\n", i+1, cats[i], vals[i]);
-        }
-    }
-}
-
-void monthly_summary(TxnList *list) {
-    char buf[64]; 
-    printf("Enter month (1-12): "); 
-    safe_input(buf, sizeof(buf)); 
-    int month = atoi(buf);
-    printf("Enter year (YYYY): "); 
-    safe_input(buf, sizeof(buf)); 
-    int year = atoi(buf);
-    int i;
-    double inc=0, exp=0;
-    for (i=0;i<list->size;i++) {
-        Transaction *t = &list->arr[i];
-        int m = parse_month(t->date), y = parse_year(t->date);
-        if (m==month && y==year) { 
-            if (strcmp(t->type,"Income")==0) 
-                inc += t->amount; 
-            else 
-                exp += t->amount; 
-        }
-    }
-    
-    printf("\n====== Monthly Summary %02d/%04d ======\n", month, year);
-    printf("Total Income : Rs. %.2f\nTotal Expense: Rs. %.2f\nSavings      : Rs. %.2f\n", inc, exp, inc-exp);
-    financial_health(list, month, year);
-}
-
-void yearly_summary(TxnList *list) {
-    char buf[64]; 
-    printf("Enter year (YYYY): "); 
-    safe_input(buf, sizeof(buf)); 
-    int year = atoi(buf);
-    int i;
-    double months_income[13]={0}, months_expense[13]={0};
-    for (i=0;i<list->size;i++) {
-        Transaction *t = &list->arr[i];
-        int m = parse_month(t->date), y = parse_year(t->date);
-        if (y==year && m>=1 && m<=12) {
-            if (strcmp(t->type,"Income")==0) 
-                months_income[m] += t->amount; 
-            else 
-                months_expense[m] += t->amount;
-        }
-    }
-    int m;
-    int count=0; 
-    for (m=1;m<=12;m++) 
-        if (months_income[m] || months_expense[m]) 
-            count++;
+        char buf[32]; get_input("Choice", buf, sizeof(buf));
+        
+        if (buf[0] == '0') { print_footer(); return; }
+        
+        if (buf[0] == '1' || buf[0] == '2') {
+            char m_str[16], y_str[16];
+            get_input("Enter month (1-12)", m_str, sizeof(m_str));
+            get_input("Enter year (e.g., 2025)", y_str, sizeof(y_str));
+            int m = atoi(m_str), y = atoi(y_str);
             
-    if (count < 12) 
-        printf(YELLOW "Note: Data present for %d month(s). Add other months for full yearly summary.\n" RESET, count);
-    
-    double yi=0, ye=0; 
-    for (m=1;m<=12;m++) { 
-        yi += months_income[m]; 
-        ye += months_expense[m]; 
-    }
-    
-    printf("\n===== Yearly Summary %04d =====\n", year);
-    printf("Total Income : Rs. %.2f\nTotal Expense: Rs. %.2f\nSavings      : Rs. %.2f\n", yi, ye, yi-ye);
-}
+            if (m < 1 || m > 12 || y < 1900 || y > 9999) {
+                print_error("Invalid month or year."); wait_enter_center(); continue;
+            }
 
-// ---------------------- Report generation & export ----------------------
-
-void generate_and_export_report(TxnList *list, const char *username) {
-    double totInc=0, totExp=0; 
-    int i;
-    for (i=0;i<list->size;i++) { 
-        if (strcmp(list->arr[i].type,"Income")==0) 
-            totInc += list->arr[i].amount; 
-        else 
-            totExp += list->arr[i].amount; 
-    }
-    
-    printf("\n===== PROFESSIONAL REPORT for %s =====\n", username);
-    printf("Total Income: Rs. %.2f\nTotal Expense: Rs. %.2f\nNet Savings: Rs. %.2f\nTransactions count: %d\n", 
-           totInc, totExp, totInc-totExp, list->size);
-    printf("\nTransactions:\n");
-    for (i=0;i<list->size;i++) {
-        Transaction *t = &list->arr[i];
-        printf("ID:%d | %s | %s | %s | Rs. %.2f\n  Note: %s\n", 
-               t->id, t->date, t->type, t->category, t->amount, 
-               strlen(t->note)?t->note:"NA");
-    }
-    
-    // Export to txt
-    char fname[256]; 
-    snprintf(fname, sizeof(fname), "report_%s.txt", username);
-    FILE *f = fopen(fname, "w"); 
-    if (!f) { 
-        printf(RED "Failed to export.\n" RESET); 
-        return; 
-    }
-    
-    fprintf(f, "PROFESSIONAL REPORT for %s\n", username);
-    fprintf(f, "Total Income: Rs. %.2f\nTotal Expense: Rs. %.2f\nNet Savings: Rs. %.2f\nTransactions count: %d\n\n", 
-            totInc, totExp, totInc-totExp, list->size);
-    
-    for (i=0;i<list->size;i++) {
-        Transaction *t = &list->arr[i];
-        fprintf(f, "ID:%d | %s | %s | %s | Rs. %.2f\nNote: %s\n\n", 
-                t->id, t->date, t->type, t->category, t->amount, 
-                strlen(t->note)?t->note:"NA");
-    }
-    fclose(f);
-    printf(GREEN "Report exported to %s\n" RESET, fname);
-}
-
-// ---------------------- Settings ----------------------
-
-void about_info() {
-    printf("\nAbout\nDevelopers: Mahandar Kumar and Tushar Kumar\nStudents, FAST-NUCES Karachi\nProject: Budget Tracker (Console)\n");
-}
-
-// ---------------------- Main user loop ----------------------
-
-void user_session(const char *username) {
-    TxnList list; 
-    init_txnlist(&list); 
-    load_transactions(username, &list);
-    double budget_limit = load_budget_limit(username);
-    char categories[MAX_CATS][MAX_CAT_LEN]; 
-    int catcount = load_default_categories(categories);
-    
-    while (1) {
-        header_anim(username);
-        printf(BOLD YELLOW "\nMenu Options:\n" RESET);
-        printf("1. Add Transaction\n2. View Transactions\n3. Manage Categories\n");
-        printf("4. View Summary\n5. Edit Transaction\6. Delete Transaction\n");
-        printf("7. Set Budget\n8. Generate & Export Report\n9. Settings\n");
-        printf("10. Save & Logout\n0. Exit\n" RESET);
-        
-        printf("Enter choice: "); 
-        char buf[64]; 
-        safe_input(buf, sizeof(buf)); 
-        int ch = atoi(buf);
-        int i;
-        if (ch==1) {
-            printf("Add: 1-Income\n2-Expense\nOther to back: "); 
-            safe_input(buf, sizeof(buf)); 
-            int a = atoi(buf);
-            if (a==1) { 
-                add_income(&list); 
-            } else if (a==2) { 
-                add_expense(&list, categories, &catcount); 
-                // Budget check
-                if (budget_limit>0) { 
-                    double inc=0, exp=0; 
-                    for (i=0;i<list.size;i++){ 
-                        if (strcmp(list.arr[i].type,"Income")==0) 
-                            inc += list.arr[i].amount; 
-                        else 
-                            exp += list.arr[i].amount; 
-                    } 
-                    if (exp > budget_limit) 
-                        printf(RED "Warning: Budget limit exceeded (%.2f)\n" RESET, budget_limit); 
-                } 
+            if (buf[0] == '2') {
+                add_transaction_flow_with_month(m, y);
             } else {
-                printf("Cancelled\n");
+                double inc = sum_income_month(m, y);
+                double ex = sum_expense_month(m, y);
+                double net = inc - ex;
+                
+                char h_buf[128]; snprintf(h_buf, sizeof(h_buf), "Dashboard - %02d/%04d", m, y);
+                print_header(h_buf);
+                
+                char line[128];
+                snprintf(line, sizeof(line), "Income:   Rs. %10.2f", inc);
+                print_centered_in_container(line, C_B_GREEN);
+                snprintf(line, sizeof(line), "Expenses: Rs. %10.2f", ex);
+                print_centered_in_container(line, C_B_RED);
+                snprintf(line, sizeof(line), "Net:      Rs. %10.2f", net);
+                print_centered_in_container(line, C_YELLOW);
+                print_separator_in_container();
+
+                if (monthly_budget > 0.0) {
+                    snprintf(line, sizeof(line), "Monthly Budget: Rs. %.2f", monthly_budget);
+                    print_centered_in_container(line, C_RESET);
+                    if (ex > monthly_budget) {
+                        print_error("Alert: Expenses exceed monthly budget!");
+                    } else if (ex > monthly_budget * 0.8) {
+                        print_centered_in_container("Warning: Expenses approaching budget limit", C_YELLOW);
+                    } else {
+                        print_success("Within budget limits");
+                    }
+                }
+                
+                wait_enter_center();
             }
-        } else if (ch==2) { 
-            show_transactions(&list); 
-        } else if (ch==3) { 
-            manage_categories(categories, &catcount); 
-        } else if (ch==4) { 
-            printf("1. Monthly 2. Yearly (other cancel): "); 
-            safe_input(buf, sizeof(buf)); 
-            int s = atoi(buf); 
-            if (s==1) 
-                monthly_summary(&list); 
-            else if (s==2) 
-                yearly_summary(&list); 
-            else 
-                printf("Cancelled\n"); 
-        } else if (ch==5) { 
-            show_transactions(&list); 
-            edit_transaction(&list); 
-        } else if (ch==6) { 
-            show_transactions(&list); 
-            delete_transaction(&list); 
-        } else if (ch==7) { 
-            printf("Enter monthly budget limit (0 to disable): "); 
-            safe_input(buf, sizeof(buf)); 
-            budget_limit = atof(buf); 
-            save_budget_limit(username, budget_limit); 
-            printf(GREEN "Budget saved.\n" RESET); 
-        } else if (ch==8) { 
-            generate_and_export_report(&list, username); 
-        } else if (ch==9) { 
-            printf("Settings: 1-Change Password 2-About 3-Back: "); 
-            safe_input(buf, sizeof(buf)); 
-            int s = atoi(buf); 
-            if (s==1) { 
-                char oldp[128], newp[128]; 
-                printf("Enter current password: "); 
-                safe_input(oldp, sizeof(oldp)); 
-                printf("Enter new password: "); 
-                safe_input(newp, sizeof(newp)); 
-                if (change_user_password(username, oldp, newp)) 
-                    printf(GREEN "Password changed.\n" RESET); 
-                else 
-                    printf(RED "Change failed.\n" RESET); 
-            } else if (s==2) 
-                about_info(); 
-        } else if (ch==10) { 
-            if (save_transactions(username, &list)) 
-                printf(GREEN "Saved.\n" RESET); 
-            else 
-                printf(RED "Save failed.\n" RESET); 
-            free_txnlist(&list); 
-            return; 
-        } else if (ch==0) { 
-            if (save_transactions(username, &list)) 
-                printf(GREEN "Saved.\n" RESET); 
-            else 
-                printf(RED "Save failed.\n" RESET); 
-            free_txnlist(&list); 
-            printf("Exiting. Goodbye!\n"); 
-            exit(0); 
-        } else {
-            printf("Invalid\n");
         }
-        
-        printf("Press Enter to continue..."); 
-        char tmp[8]; 
-        fgets(tmp, sizeof(tmp), stdin);
-    }
-}
-
-// ---------------------- Auth menu ----------------------
-
-void auth_menu() {
-    while (1) {
-        clear_screen();
-        printf(BOLD CYAN "========================================\n" RESET);
-        type_print("           Budget Tracker", 2);
-        printf(BOLD CYAN "========================================\n" RESET);
-        printf(YELLOW "1. Login\n2. Register\n3. Exit\n" RESET);
-        printf("Choice: "); 
-        char buf[128]; 
-        safe_input(buf, sizeof(buf)); 
-        int ch = atoi(buf);
-        
-        if (ch==1) {
-            char u[64], p[128]; 
-            printf("Username: "); 
-            safe_input(u, sizeof(u)); 
-            printf("Password: "); 
-            safe_input(p, sizeof(p));
-            spinner(6);
-            if (verify_user(u, p)) { 
-                printf(GREEN "Login successful.\n" RESET); 
-                user_session(u); 
+        else if (buf[0] == '3') {
+            print_header("RECENT TRANSACTIONS");
+            if (txn_count == 0) {
+                print_centered_in_container("No transactions recorded.", C_RESET);
             } else {
-                printf(RED "Login failed.\n" RESET);
+                int count = (txn_count < 10) ? txn_count : 10;
+                for (int i = txn_count - count; i < txn_count; ++i) {
+                    Transaction *t = &txns[i];
+                    char line[256];
+                    char* color = (strcmp(t->type, "Income") == 0) ? C_GREEN : C_RED;
+                    snprintf(line, sizeof(line), "ID:%d | %02d/%02d/%04d | %-8s | %-15s | %.2f | %s",
+                            t->id, t->day, t->month, t->year, 
+                            t->type, t->category, t->amount, 
+                            t->note[0] ? t->note : "NA");
+                    print_left_in_container(line, color);
+                }
+                char count_msg[64];
+                snprintf(count_msg, sizeof(count_msg), "Showing %d most recent transactions", count);
+                print_empty_line_in_container();
+                print_centered_in_container(count_msg, C_RESET);
             }
-        } else if (ch==2) {
-            char u[64], p[128]; 
-            printf("Choose username: "); 
-            safe_input(u, sizeof(u)); 
-            if (strlen(u)==0) { 
-                printf("Invalid.\n"); 
-                continue; 
-            }
-            if (user_exists(u)) { 
-                printf(RED "Taken.\n" RESET); 
-                continue; 
-            }
-            printf("Choose password: "); 
-            safe_input(p, sizeof(p));
-            if (register_user(u, p)) 
-                printf(GREEN "Registered. Login now.\n" RESET); 
-            else 
-                printf(RED "Register failed.\n" RESET);
-        } else if (ch==3) { 
-            printf("Goodbye.\n"); 
-            exit(0); 
-        } else {
-            printf("Invalid.\n");
+            wait_enter_center();
         }
-        
-        printf("Press Enter..."); 
-        char tmp[8]; 
-        fgets(tmp, sizeof(tmp), stdin);
+        else {
+            print_error("Invalid choice.");
+            wait_enter_center();
+        }
+        print_footer();
     }
 }
 
-int main() {
-    clear_screen();
-    printf(BOLD MAGENTA);
-    type_print("========================================", 1);
-    type_print("*     Budget Tracker - Console App     *", 1);
-    type_print("========================================", 1);
-    printf(RESET);
-    spinner(6);
+/* ---------- Main Menu (Entry point after Login) ---------- */
+int main(void) {
+    load_default_categories();
     auth_menu();
+    while (cur_user[0]) {
+        print_header("MAIN MENU");
+        char greet[80]; snprintf(greet,sizeof(greet),"Hello, %s", cur_user); 
+        print_centered_in_container(greet, C_CYAN);
+        print_empty_line_in_container();
+        print_left_in_container("1) Dashboard (Summary & Recent)", C_RESET);
+        print_left_in_container("2) Add Transaction (Quick)", C_RESET);
+        print_left_in_container("3) Manage Transactions (Edit/Delete/Search)", C_RESET);
+        print_left_in_container("4) Manage Categories (View/Add)", C_RESET);
+        print_left_in_container("5) View Detailed Summary (Monthly/Yearly)", C_RESET);
+        print_left_in_container("6) Set Monthly Budget", C_RESET);
+        print_left_in_container("7) Export Report (TXT)", C_RESET);
+        print_left_in_container("8) Settings (Password/About)", C_RESET);
+        print_left_in_container("9) Save & Logout", C_RESET);
+        print_left_in_container("0) Exit", C_RESET);
+        print_empty_line_in_container();
+        
+        char buf[32]; get_input("Enter choice", buf, sizeof(buf));
+        
+        if (buf[0]=='0') { 
+            save_transactions_for_user(cur_user); 
+            save_settings_for_user(cur_user); 
+            print_header("Goodbye."); 
+            break; 
+        } else if (strcmp(buf,"1")==0) { dashboard_menu(); }
+        else if (strcmp(buf,"2")==0) add_transaction_flow_with_month(0,0);
+        else if (strcmp(buf,"3")==0) manage_transactions_menu();
+        else if (strcmp(buf,"4")==0) manage_categories_menu();
+        else if (strcmp(buf,"5")==0) view_summary_menu();
+        else if (strcmp(buf,"6")==0) set_budget_menu();
+        else if (strcmp(buf,"7")==0) generate_export_report();
+        else if (strcmp(buf,"8")==0) settings_menu();
+        else if (strcmp(buf,"9")==0) { 
+            save_transactions_for_user(cur_user); 
+            save_settings_for_user(cur_user); 
+            cur_user[0]=0; 
+            auth_menu(); 
+        } else { print_error("Invalid choice."); wait_enter_center(); }
+        print_footer();
+    }
     return 0;
+}
+
+/* --- Remaining Menu Implementations --- */
+
+void manage_transactions_menu(void) {
+    while (1) {
+        print_header("MANAGE TRANSACTIONS");
+        print_left_in_container("1) Add Transaction (Quick)", C_RESET);
+        print_left_in_container("2) Edit Transaction by ID", C_RESET);
+        print_left_in_container("3) Delete Transaction by ID", C_RESET);
+        print_left_in_container("4) Search Transactions by Date (DD/MM/YYYY)", C_RESET);
+        print_left_in_container("0) Back", C_RESET);
+        char buf[32]; get_input("Choice", buf, sizeof(buf));
+        if (buf[0] == '0') { print_footer(); return; }
+        if (buf[0] == '1') { add_transaction_flow_with_month(0,0); }
+        else if (buf[0] == '2') {
+            get_input("Enter transaction ID to edit", buf, sizeof(buf)); int id = atoi(buf);
+            Transaction *t = find_txn_by_id(id);
+            if (!t) { print_error("Not found."); wait_enter_center(); continue; }
+            print_header("EDIT TRANSACTION");
+            char tmp[128];
+            snprintf(tmp,sizeof(tmp),"Current Type: %s", t->type); print_centered_in_container(tmp, C_RESET);
+            get_input("Enter new type (Income/Expense) or blank", tmp, sizeof(tmp)); if (tmp[0]) { strncpy(t->type,tmp,sizeof(t->type)-1); t->type[sizeof(t->type)-1]='\0'; }
+            snprintf(tmp,sizeof(tmp),"Current Category: %s", t->category); print_centered_in_container(tmp, C_RESET);
+            get_input("Enter new category or blank", tmp, sizeof(tmp)); if (tmp[0]) { strncpy(t->category,tmp,sizeof(t->category)-1); t->category[sizeof(t->category)-1]='\0'; }
+            snprintf(tmp,sizeof(tmp),"Current amount: %.2f", t->amount); print_centered_in_container(tmp, C_RESET);
+            get_input("Enter new amount or blank", tmp, sizeof(tmp)); if (tmp[0]) t->amount = atof(tmp);
+            char datebuf[16]; snprintf(datebuf,sizeof(datebuf), "%02d/%02d/%04d", t->day, t->month, t->year);
+            snprintf(tmp,sizeof(tmp),"Current date: %s", datebuf); print_centered_in_container(tmp, C_RESET);
+            get_input("Enter new date DD/MM/YYYY or blank", tmp, sizeof(tmp));
+            if (tmp[0]) { 
+                if (is_valid_date(tmp)) { 
+                    int dd,mm,yy; 
+                    if (sscanf(tmp,"%d/%d/%d",&dd,&mm,&yy) == 3) { t->day=dd; t->month=mm; t->year=yy; }
+                } else print_error("Invalid date ignored."); 
+            }
+            snprintf(tmp,sizeof(tmp),"Current note: %s", t->note[0]?t->note:"NA"); print_centered_in_container(tmp, C_RESET);
+            get_input("Enter new note or blank", tmp, sizeof(tmp)); if (tmp[0]) { strncpy(t->note,tmp,sizeof(t->note)-1); t->note[sizeof(t->note)-1]='\0'; }
+            save_transactions_for_user(cur_user);
+            print_success("Updated."); wait_enter_center();
+        } else if (buf[0] == '3') {
+            get_input("Enter transaction ID to delete", buf, sizeof(buf)); int id = atoi(buf);
+            if (delete_txn_by_id(id)) { save_transactions_for_user(cur_user); print_success("Deleted."); }
+            else print_error("Not found.");
+            wait_enter_center();
+        } else if (buf[0] == '4') {
+            get_input("Enter date DD/MM/YYYY to search", buf, sizeof(buf));
+            if (!is_valid_date(buf)) { print_error("Invalid date format."); wait_enter_center(); continue; }
+            char h_buf[128]; snprintf(h_buf, sizeof(h_buf), "Search results for %s", buf);
+            print_header(h_buf);
+            int found = 0;
+            int dd,mm,yy; sscanf(buf,"%d/%d/%d",&dd,&mm,&yy);
+            for (int i=0;i<txn_count;i++) {
+                if (txns[i].day==dd && txns[i].month==mm && txns[i].year==yy) {
+                    char line[256]; char* color = (strcmp(txns[i].type, "Income") == 0) ? C_GREEN : C_RED;
+                    snprintf(line,sizeof(line),"ID:%d | %02d/%02d/%04d | %-8s | %-15s | %.2f | %s",
+                                               txns[i].id, txns[i].day, txns[i].month, txns[i].year, txns[i].type, txns[i].category, txns[i].amount, txns[i].note[0]?txns[i].note:"NA");
+                    print_left_in_container(line, color); found++;
+                }
+            }
+            if (!found) print_centered_in_container("No transactions found for that date.", C_RESET);
+            wait_enter_center();
+        } else { print_error("Invalid choice."); wait_enter_center(); }
+        print_footer();
+    }
+}
+
+void manage_categories_menu(void) {
+    while (1) {
+        print_header("MANAGE CATEGORIES");
+        print_left_in_container("1) View categories", C_RESET);
+        print_left_in_container("2) Add category (session)", C_RESET);
+        print_left_in_container("0) Back", C_RESET);
+        char c[64]; get_input("Choice", c, sizeof(c));
+        if (c[0] == '0') { print_footer(); return; }
+        if (c[0] == '1') {
+            print_header("CATEGORIES");
+            for (int i=0;i<cat_count;i++) { char line[128]; snprintf(line,sizeof(line), "%d) %s", i+1, cats[i]); print_left_in_container(line, C_RESET); }
+            wait_enter_center();
+        } else if (c[0] == '2') {
+            char name[64]; get_input("Enter new category name", name, sizeof(name));
+            add_category_session(name);
+            print_success("Added (session).");
+            wait_enter_center();
+        } else { print_error("Invalid choice."); wait_enter_center(); }
+        print_footer();
+    }
+}
+
+void view_summary_menu(void) {
+    while (1) {
+        print_header("SUMMARY");
+        print_left_in_container("1) Monthly summary", C_RESET);
+        print_left_in_container("2) Yearly summary", C_RESET);
+        print_left_in_container("0) Back", C_RESET);
+        char c[64]; get_input("Choice", c, sizeof(c));
+        if (c[0] == '0') { print_footer(); return; }
+        if (c[0] == '1') {
+            get_input("Enter month (1-12)", c, sizeof(c)); int m = atoi(c);
+            get_input("Enter year (e.g., 2025)", c, sizeof(c)); int y = atoi(c);
+            double inc = sum_income_month(m,y), ex = sum_expense_month(m,y);
+            double net = inc - ex;
+            char h_buf[128]; snprintf(h_buf, sizeof(h_buf), "Monthly Summary %02d/%04d", m, y);
+            print_header(h_buf);
+            char l1[80], l2[80], l3[80];
+            snprintf(l1,sizeof(l1),"Total Income : Rs. %.2f", inc); print_centered_in_container(l1, C_B_GREEN);
+            snprintf(l2,sizeof(l2),"Total Expense: Rs. %.2f", ex); print_centered_in_container(l2, C_B_RED);
+            snprintf(l3,sizeof(l3),"Net Savings  : Rs. %.2f", net); print_centered_in_container(l3, C_YELLOW);
+
+            print_centered_in_container("--- Financial Health ---", C_RESET);
+            if (ex > inc) { print_error("Health: Expenses exceed income!"); } 
+            else {
+                double ratio = inc ? (ex/inc*100.0) : 0;
+                if (ratio > 80.0) { print_centered_in_container("Health: High spending (>80% of income)", C_YELLOW); } 
+                else { print_success("Health: Good"); }
+            }
+            wait_enter_center();
+        } else if (c[0] == '2') {
+            get_input("Enter year (e.g., 2025)", c, sizeof(c)); int y = atoi(c);
+            double yi=0, ye=0; int months_present=0;
+            for (int m=1;m<=12;m++) {
+                double inc = sum_income_month(m,y), ex = sum_expense_month(m,y);
+                if (inc || ex) months_present++;
+                yi+=inc; ye+=ex;
+            }
+            char h_buf[128]; snprintf(h_buf, sizeof(h_buf), "Yearly Summary %04d", y);
+            print_header(h_buf);
+            char l1[80], l2[80], l3[80];
+            snprintf(l1,sizeof(l1),"Year Income : Rs. %.2f", yi); print_centered_in_container(l1, C_B_GREEN);
+            snprintf(l2,sizeof(l2),"Year Expense: Rs. %.2f", ye); print_centered_in_container(l2, C_B_RED);
+            snprintf(l3,sizeof(l3),"Year Savings: Rs. %.2f", yi-ye); print_centered_in_container(l3, C_YELLOW);
+
+            if (months_present < 12) {
+                char tmp[128]; snprintf(tmp,sizeof(tmp),"Note: data present for %d month(s).", months_present);
+                print_centered_in_container(tmp, C_RESET);
+            }
+            wait_enter_center();
+        } else { print_error("Invalid choice."); wait_enter_center(); }
+        print_footer();
+    }
+}
+
+void set_budget_menu(void) {
+    print_header("SET BUDGET");
+    char b[64]; get_input("Enter monthly budget amount (0 to disable)", b, sizeof(b));
+    monthly_budget = atof(b);
+    save_settings_for_user(cur_user);
+    print_success("Budget saved.");
+    wait_enter_center();
+    print_footer();
+}
+
+void generate_export_report(void) {
+    print_header("GENERATE & EXPORT REPORT");
+    char buf[32]; 
+    get_input("Enter month (1-12)", buf, sizeof(buf)); 
+    int m = atoi(buf);
+    get_input("Enter year (YYYY)", buf, sizeof(buf)); 
+    int y = atoi(buf);
+
+    if (m < 1 || m > 12 || y < 1900 || y > 9999) {
+        print_error("Invalid month or year. Aborting.");
+        wait_enter_center(); 
+        print_footer();
+        return;
+    }
+
+    // Change file extension to .txt
+    char fname[128]; snprintf(fname,sizeof(fname),"report_%s_%02d-%04d.txt", cur_user, m, y);
+    FILE *f = fopen(fname, "w");
+    if (!f) { print_error("Failed to create report file."); wait_enter_center(); print_footer(); return; }
+
+    // Write formatted TXT content
+    fprintf(f, "================================================================================\n");
+    fprintf(f, "                      FINANCIAL REPORT: %02d/%04d\n", m, y);
+    fprintf(f, "                             User: %s\n", cur_user);
+    fprintf(f, "================================================================================\n");
+    
+    // Column Headers (Fixed-width for TXT)
+    fprintf(f, "  ID | DATE       | TYPE     | CATEGORY           | AMOUNT (Rs) | NOTE\n");
+    fprintf(f, "--------------------------------------------------------------------------------\n");
+    
+    int found_count = 0;
+    double total_income = 0.0;
+    double total_expense = 0.0;
+
+    for (int i=0;i<txn_count;i++) if (txns[i].month==m && txns[i].year==y) {
+        found_count++;
+        
+        // Accumulate totals
+        if (strcmp(txns[i].type, "Income") == 0) total_income += txns[i].amount;
+        else total_expense += txns[i].amount;
+        
+        // Use a temporary variable for note and limit its length for formatting
+        char safe_note[192]; snprintf(safe_note, sizeof(safe_note), "%.30s", txns[i].note);
+        
+        // Print transaction line (ID, Date, Type, Category, Amount, Note)
+        fprintf(f, "%4d | %02d/%02d/%04d | %-8s | %-18s | %11.2f | %s\n", 
+                txns[i].id, txns[i].day, txns[i].month, txns[i].year, 
+                txns[i].type, txns[i].category, txns[i].amount, 
+                safe_note);
+    }
+    
+    // Summary Footer
+    fprintf(f, "--------------------------------------------------------------------------------\n");
+    if (found_count == 0) {
+        fprintf(f, "                             No transactions recorded for this period.\n");
+    } else {
+        fprintf(f, "TOTAL INCOME:                                                 %11.2f\n", total_income);
+        fprintf(f, "TOTAL EXPENSE:                                                %11.2f\n", total_expense);
+        fprintf(f, "NET BALANCE:                                                  %11.2f\n", total_income - total_expense);
+    }
+    fprintf(f, "================================================================================\n");
+
+    fclose(f);
+    char mmsg[128]; snprintf(mmsg,sizeof(mmsg),"Saved to: %s", fname);
+    print_success("Report exported successfully (TXT format).");
+    print_centered_in_container(mmsg, C_RESET);
+    wait_enter_center();
+    print_footer();
+}
+
+void settings_menu(void) {
+    while (1) {
+        print_header("SETTINGS");
+        print_left_in_container("1) Change password", C_RESET);
+        print_left_in_container("2) About", C_RESET);
+        print_left_in_container("0) Back", C_RESET);
+        char c[64]; get_input("Choice", c, sizeof(c));
+        if (c[0]=='0') { print_footer(); return; }
+        if (c[0]=='1') {
+            char curp[128], np[128]; 
+            get_input("Enter current password", curp, sizeof(curp));
+            if (!verify_user_file(cur_user, curp)) { print_error("Incorrect current password."); wait_enter_center(); continue; }
+            get_input("Enter new password", np, sizeof(np));
+            
+            FILE *f = fopen(USERS_CSV, "r"); if (!f) return;
+            FILE *t = fopen("users_tmp.csv", "w"); if (!t) { fclose(f); return; }
+            char line[MAX_LINE];
+            while (fgets(line, sizeof(line), f)) {
+                char u[64], penc[128];
+                if (sscanf(line, "%63[^,],%127[^\n]", u, penc) == 2) {
+                    if (strcmp(u, cur_user) == 0) {
+                        char enc[128]; strncpy(enc, np, sizeof(enc)-1); enc[sizeof(enc)-1]='\0'; xor_str(enc);
+                        fprintf(t, "%s,%s\n", u, enc);
+                    } else fprintf(t, "%s", line);
+                }
+            }
+            fclose(f); fclose(t);
+            remove(USERS_CSV); rename("users_tmp.csv", USERS_CSV);
+            print_success("Password changed."); wait_enter_center();
+        } else if (c[0]=='2') {
+            print_header("ABOUT");
+            print_centered_in_container("Personal Budget Tracker", C_RESET);
+            print_centered_in_container("Developers: Mahandar Kumar & Tushar Kumar", C_RESET);
+            print_centered_in_container("FAST-NUCES Karachi", C_RESET);
+            print_centered_in_container("This console application was built as a semester project.", C_RESET);
+            wait_enter_center();
+        } else { print_error("Invalid choice."); wait_enter_center(); }
+        print_footer();
+    }
 }
