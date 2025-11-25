@@ -1,16 +1,9 @@
-/*
-  budget_tracker_optimized.c
-  Optimized version with centered container and left-aligned menus.
-  Compile: gcc -o budget_tracker budget_tracker_optimized.c
-*/
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <ctype.h>
 
-/* Cross-platform sleep utility */
 #ifdef _WIN32
 #include <windows.h>
 #define sleep_ms(ms) Sleep(ms)
@@ -19,7 +12,6 @@
 static void sleep_ms(int ms) { usleep(ms * 1000); }
 #endif
 
-/* ---------- Config & constants ---------- */
 #define TERM_WIDTH 80
 #define CONTAINER_WIDTH 70  // Reduced width for the container
 #define USERS_CSV "users.csv"
@@ -28,7 +20,6 @@ static void sleep_ms(int ms) { usleep(ms * 1000); }
 #define MAX_LINE 1024
 #define XOR_KEY 0x5A
 
-/* ANSI colors - Standardized */
 #define C_RESET  "\033[0m"
 #define C_BOLD   "\033[1m"
 #define C_GREEN  "\033[32m"
@@ -41,17 +32,15 @@ static void sleep_ms(int ms) { usleep(ms * 1000); }
 #define C_BLUE    "\033[34m"
 #define C_B_BLUE  "\033[1;34m"
 
-/* ---------- Types ---------- */
 typedef struct {
     int day, month, year;
-    char type[12];      /* "Income" / "Expense" */
+    char type[12];      
     char category[64];
     double amount;
     char note[192];
     int id;
 } Transaction;
 
-/* ---------- Global session ---------- */
 static char cur_user[64] = "";
 static Transaction txns[MAX_TXNS];
 static int txn_count = 0;
@@ -59,9 +48,6 @@ static char cats[MAX_CATS][64];
 static int cat_count = 0;
 static double monthly_budget = 0.0;
 
-/* ---------- Utility functions: UI/UX ---------- */
-
-// Print container border
 static void print_border_line(int is_top) {
     int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
     printf("%*s%s", pad, "", C_B_BLUE);
@@ -82,7 +68,6 @@ static void print_side_borders(void) {
     printf("%*s%s¦%*s¦%s\n", pad, "", C_B_BLUE, CONTAINER_WIDTH - 2, "", C_RESET);
 }
 
-// Centered text within container
 static void print_centered_in_container(const char *s, const char *color) {
     int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
     int text_pad = (CONTAINER_WIDTH - (int)strlen(s)) / 2;
@@ -94,7 +79,6 @@ static void print_centered_in_container(const char *s, const char *color) {
            C_RESET);
 }
 
-// Left-aligned text within container
 static void print_left_in_container(const char *s, const char *color) {
     int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
     printf("%*s%s¦ %s%s%*s¦%s\n", 
@@ -104,13 +88,11 @@ static void print_left_in_container(const char *s, const char *color) {
            C_RESET);
 }
 
-// Empty line in container
 static void print_empty_line_in_container(void) {
     int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
     printf("%*s%s¦%*s¦%s\n", pad, "", C_B_BLUE, CONTAINER_WIDTH - 2, "", C_RESET);
 }
 
-// Separator line in container
 static void print_separator_in_container(void) {
     int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
     printf("%*s%s¦", pad, "", C_B_BLUE);
@@ -155,8 +137,6 @@ static void get_input(const char *prompt, char *out, int sz) {
     out[strcspn(out, "\n")] = 0;
 }
 
-/* ---------- Utility functions: Core Logic ---------- */
-
 static void xor_str(char *s) {
     for (int i = 0; s[i]; ++i) s[i] ^= XOR_KEY;
 }
@@ -200,8 +180,6 @@ static void add_category_session(const char *name) {
     }
 }
 
-/* ---------- UI: Animation/UX Improvement (Loading Bar) ---------- */
-
 static void welcome_animation(const char *username_display) {
     print_header("Personal Budget Tracker");
     if (username_display && username_display[0]) {
@@ -210,9 +188,8 @@ static void welcome_animation(const char *username_display) {
     } else {
         print_centered_in_container("Hello, User", C_CYAN);
     }
-    
-    // Loading Bar Animation
-    print_empty_line_in_container();
+
+  print_empty_line_in_container();
     int bar_width = 40;
     int pad = (TERM_WIDTH - CONTAINER_WIDTH) / 2;
     printf("%*s%s¦", pad, "", C_B_BLUE);
@@ -228,8 +205,6 @@ static void welcome_animation(const char *username_display) {
     sleep_ms(150);
     print_footer();
 }
-
-/* ---------- File I/O (Authentication, Transactions, Settings) ---------- */
 
 static int verify_user_file(const char *username, const char *password) {
     FILE *f = fopen(USERS_CSV, "r");
@@ -315,8 +290,6 @@ static void save_settings_for_user(const char *username) {
     fclose(f);
 }
 
-/* ---------- Business rules (Calculations) ---------- */
-
 static double sum_income_month(int m, int y) {
     double s = 0.0;
     for (int i = 0; i < txn_count; ++i)
@@ -362,8 +335,6 @@ static void get_transaction_details(Transaction *t) {
     get_input("Enter note (optional)", t->note, sizeof(t->note));
 }
 
-/* ---------- Add Transaction Flow ---------- */
-
 void add_transaction_flow_with_month(int m_pref, int y_pref) {
     if (txn_count >= MAX_TXNS) { print_error("Transaction limit reached."); wait_enter_center(); return; }
 
@@ -382,8 +353,7 @@ void add_transaction_flow_with_month(int m_pref, int y_pref) {
         strncpy(t.type, is_income ? "Income" : "Expense", sizeof(t.type)-1);
         t.type[sizeof(t.type)-1] = '\0';
 
-        // Date selection
-        char datebuf[16], tmp[64];
+      char datebuf[16], tmp[64];
         if (m_pref && y_pref) {
             get_input("Enter day of month (1-31) or empty for 1", tmp, sizeof(tmp));
             int dd = tmp[0] ? atoi(tmp) : 1;
@@ -400,7 +370,6 @@ void add_transaction_flow_with_month(int m_pref, int y_pref) {
         }
         if (sscanf(datebuf,"%d/%d/%d",&t.day,&t.month,&t.year) != 3) { print_error("Date processing error."); wait_enter_center(); continue; }
 
-        // Category selection
         print_centered_in_container(is_income ? "Choose income category:" : "Choose expense category:", C_RESET);
         int sel_idxs[MAX_CATS], sel_count=0;
         for (int i=0; i<cat_count; i++) {
@@ -427,7 +396,6 @@ void add_transaction_flow_with_month(int m_pref, int y_pref) {
         get_transaction_details(&t);
         if (t.amount <= 0) continue;
 
-        // Validation checks
         if (is_income && strcasecmp(t.category, "Salary") == 0 && salary_exists_in_month(t.month, t.year)) {
             print_error("Salary already added for this month. Cannot add another.");
             wait_enter_center(); continue;
@@ -455,7 +423,6 @@ void add_transaction_flow_with_month(int m_pref, int y_pref) {
     print_footer();
 }
 
-/* ---------- Authentication Menu (Entry point) ---------- */
 static void auth_menu(void) {
     while (1) {
         print_header("AUTHENTICATION");
@@ -512,7 +479,6 @@ static void auth_menu(void) {
     }
 }
 
-/* ---------- Dashboard Menu ---------- */
 void dashboard_menu(void) {
     while (1) {
         print_header("DASHBOARD");
@@ -602,7 +568,6 @@ void dashboard_menu(void) {
     }
 }
 
-/* ---------- Main Menu (Entry point after Login) ---------- */
 int main(void) {
     load_default_categories();
     auth_menu();
@@ -648,9 +613,6 @@ int main(void) {
     }
     return 0;
 }
-
-/* --- Remaining Menu Implementations --- */
-
 void manage_transactions_menu(void) {
     while (1) {
         print_header("MANAGE TRANSACTIONS");
@@ -814,18 +776,15 @@ void generate_export_report(void) {
         return;
     }
 
-    // Change file extension to .txt
     char fname[128]; snprintf(fname,sizeof(fname),"report_%s_%02d-%04d.txt", cur_user, m, y);
     FILE *f = fopen(fname, "w");
     if (!f) { print_error("Failed to create report file."); wait_enter_center(); print_footer(); return; }
 
-    // Write formatted TXT content
     fprintf(f, "================================================================================\n");
     fprintf(f, "                      FINANCIAL REPORT: %02d/%04d\n", m, y);
     fprintf(f, "                             User: %s\n", cur_user);
     fprintf(f, "================================================================================\n");
-    
-    // Column Headers (Fixed-width for TXT)
+ 
     fprintf(f, "  ID | DATE       | TYPE     | CATEGORY           | AMOUNT (Rs) | NOTE\n");
     fprintf(f, "--------------------------------------------------------------------------------\n");
     
@@ -836,21 +795,17 @@ void generate_export_report(void) {
     for (int i=0;i<txn_count;i++) if (txns[i].month==m && txns[i].year==y) {
         found_count++;
         
-        // Accumulate totals
         if (strcmp(txns[i].type, "Income") == 0) total_income += txns[i].amount;
         else total_expense += txns[i].amount;
         
-        // Use a temporary variable for note and limit its length for formatting
         char safe_note[192]; snprintf(safe_note, sizeof(safe_note), "%.30s", txns[i].note);
         
-        // Print transaction line (ID, Date, Type, Category, Amount, Note)
         fprintf(f, "%4d | %02d/%02d/%04d | %-8s | %-18s | %11.2f | %s\n", 
                 txns[i].id, txns[i].day, txns[i].month, txns[i].year, 
                 txns[i].type, txns[i].category, txns[i].amount, 
                 safe_note);
     }
     
-    // Summary Footer
     fprintf(f, "--------------------------------------------------------------------------------\n");
     if (found_count == 0) {
         fprintf(f, "                             No transactions recorded for this period.\n");
@@ -909,3 +864,4 @@ void settings_menu(void) {
         print_footer();
     }
 }
+
